@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import styles from './App.module.css'
 
 const initialTree = [
@@ -218,6 +218,9 @@ function TreeNode({ node, depth, selectedFolderId, expandedFolders, onSelectFold
 
 function App() {
   const [isDark, setIsDark] = useState(true)
+  const [isLoggedIn, setIsLoggedIn] = useState(() => {
+    return window.localStorage.getItem('webide:isLoggedIn') === 'true'
+  })
   const [currentView, setCurrentView] = useState('home')
   const [authMode, setAuthMode] = useState('login')
   const [showAuthModal, setShowAuthModal] = useState(false)
@@ -228,11 +231,122 @@ function App() {
   const [openTabs, setOpenTabs] = useState([])
   const [activeTabId, setActiveTabId] = useState(null)
   const [messages, setMessages] = useState(initialMessages)
+  const [onlineCount, setOnlineCount] = useState(1)
+  const [clientId, setClientId] = useState(null)
+  const [chatSearch, setChatSearch] = useState('')
   const [chatInput, setChatInput] = useState('')
+  const [chatUserName, setChatUserName] = useState(() => {
+    return window.localStorage.getItem('webide:isLoggedIn') === 'true' ? 'Me' : 'Guest'
+  })
   const [tree, setTree] = useState(initialTree)
   const [selectedFolderId, setSelectedFolderId] = useState('1')
   const [expandedFolders, setExpandedFolders] = useState(() => new Set(['1', '2']))
   const [newItemName, setNewItemName] = useState('')
+  const wsRef = useRef(null)
+
+  useEffect(() => {
+    const socket = new WebSocket('ws://localhost:8080')
+    wsRef.current = socket
+
+    socket.addEventListener('open', () => {
+      socket.send(JSON.stringify({ type: 'set_name', user: chatUserName }))
+    })
+
+    socket.addEventListener('message', (event) => {
+      let payload
+      try {
+        payload = JSON.parse(event.data)
+      } catch {
+        return
+      }
+
+      if (payload.type === 'online') {
+        setOnlineCount(payload.count ?? 1)
+        return
+      }
+
+      if (payload.type === 'session') {
+        setClientId(payload.clientId ?? null)
+        return
+      }
+
+      if (payload.type === 'history') {
+        const history = Array.isArray(payload.messages)
+          ? payload.messages.map((message) => ({
+              id: message.id ?? `m-${Date.now()}`,
+              user: message.user ?? 'System',
+              text: message.text ?? '',
+              at: message.at ?? new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+              senderId: message.senderId ?? null
+            }))
+          : []
+
+        setMessages(history)
+        return
+      }
+
+      if (payload.type === 'chat' || payload.type === 'system') {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: payload.id ?? `m-${Date.now()}`,
+            user: payload.user ?? 'System',
+            text: payload.text ?? '',
+            at: payload.at ?? new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            senderId: payload.senderId ?? null
+          }
+        ])
+      }
+    })
+
+    return () => {
+      socket.close()
+      wsRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'set_name', user: chatUserName }))
+    }
+  }, [chatUserName])
+
+  useEffect(() => {
+    window.localStorage.setItem('webide:isLoggedIn', String(isLoggedIn))
+  }, [isLoggedIn])
+
+  const normalizedSearch = chatSearch.trim().toLowerCase()
+  const filteredMessages = useMemo(() => {
+    if (!normalizedSearch) {
+      return messages
+    }
+
+    return messages.filter((message) => {
+      return `${message.user} ${message.text}`.toLowerCase().includes(normalizedSearch)
+    })
+  }, [messages, normalizedSearch])
+
+  function renderMessageText(text) {
+    if (!normalizedSearch) {
+      return text
+    }
+
+    const escaped = normalizedSearch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const regex = new RegExp(`(${escaped})`, 'ig')
+    const parts = String(text).split(regex)
+
+    return parts.map((part, index) => {
+      if (part.toLowerCase() === normalizedSearch) {
+        return (
+          <mark key={`${part}-${index}`} className={styles.messageMark}>
+            {part}
+          </mark>
+        )
+      }
+
+      return <span key={`${part}-${index}`}>{part}</span>
+    })
+  }
 
   const files = useMemo(() => flattenFiles(tree), [tree])
   const activeTab = openTabs.find((tab) => tab.id === activeTabId) ?? null
@@ -325,15 +439,28 @@ function App() {
   function sendMessage() {
     if (!chatInput.trim()) return
 
-    const newMessage = {
-      id: `m-${Date.now()}`,
-      user: 'Me',
-      text: chatInput.trim(),
-      at: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'chat', text: chatInput.trim() }))
     }
-
-    setMessages((prev) => [...prev, newMessage])
     setChatInput('')
+  }
+
+  function updateChatUserName(nextName) {
+    const normalized = nextName.trim()
+    if (!normalized) return
+
+    setChatUserName(normalized)
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'set_name', user: normalized }))
+    }
+  }
+
+  function toggleLogin() {
+    setIsLoggedIn((prev) => {
+      const next = !prev
+      updateChatUserName(next ? 'Me' : 'Guest')
+      return next
+    })
   }
 
   function openIdeHome() {
@@ -385,6 +512,7 @@ function App() {
     window.setTimeout(() => {
       setIsSubmittingAuth(false)
       setAuthSuccess(authMode === 'login' ? '로그인되었습니다.' : '회원가입이 완료되었습니다.')
+      updateChatUserName(email.split('@')[0] || 'Me')
       setCurrentView('ide')
       window.setTimeout(() => {
         setShowAuthModal(false)
@@ -411,12 +539,8 @@ function App() {
                 테마변경
               </button>
               <span className={styles.topDivider}>|</span>
-              <button className={styles.topTextBtn} onClick={() => openAuth('login')}>
-                로그인
-              </button>
-              <span className={styles.topDivider}>|</span>
-              <button className={styles.topTextBtn} onClick={() => openAuth('signup')}>
-                무료 시작
+              <button className={styles.topTextBtn} onClick={toggleLogin}>
+                로그인 {isLoggedIn ? 'ON' : 'OFF'}
               </button>
             </div>
           </>
@@ -432,12 +556,8 @@ function App() {
                 테마변경
               </button>
               <span className={styles.topDivider}>|</span>
-              <button className={styles.topTextBtn} onClick={() => openAuth('login')}>
-                로그인
-              </button>
-              <span className={styles.topDivider}>|</span>
-              <button className={styles.topTextBtn} onClick={() => openAuth('signup')}>
-                회원가입
+              <button className={styles.topTextBtn} onClick={toggleLogin}>
+                로그인 {isLoggedIn ? 'ON' : 'OFF'}
               </button>
             </div>
           </>
@@ -647,36 +767,60 @@ function App() {
               <div className={styles.chatChannel}>
                 <span className={styles.hash}>#</span>
                 <span>general</span>
-                <span className={styles.chatOnline}>4 online</span>
+                <span className={styles.chatOnline}>online {onlineCount} person</span>
+                {normalizedSearch ? (
+                  <span className={styles.chatOnline}>{filteredMessages.length} matches</span>
+                ) : null}
               </div>
               <div className={styles.chatTools}>
-                <button type="button" title="검색">⌕</button>
                 <button type="button" title="확대">↗</button>
               </div>
             </div>
+            <div className={styles.chatSearchRow}>
+              <span className={styles.chatSearchIcon}>⌕</span>
+              <input
+                className={styles.chatSearchInput}
+                value={chatSearch}
+                onChange={(event) => setChatSearch(event.target.value)}
+                placeholder="채팅 내용 검색..."
+              />
+              {chatSearch ? (
+                <button type="button" className={styles.chatSearchClear} onClick={() => setChatSearch('')}>
+                  x
+                </button>
+              ) : null}
+            </div>
             <div className={styles.messages}>
-              {messages.map((message) => (
+              {filteredMessages.length === 0 ? (
+                <div className={styles.chatNoResults}>검색 결과가 없습니다.</div>
+              ) : null}
+              {filteredMessages.map((message) => {
+                const isOwnMessage = Boolean(clientId) && message.senderId === clientId
+
+                return (
                 <div
                   key={message.id}
-                  className={`${styles.messageRow} ${message.user === 'Me' ? styles.messageRowOwn : ''}`}
+                  className={`${styles.messageRow} ${isOwnMessage ? styles.messageRowOwn : ''}`}
                 >
-                  <div className={`${styles.messageColumn} ${message.user === 'Me' ? styles.messageColumnOwn : ''}`}>
+                  <div className={`${styles.messageColumn} ${isOwnMessage ? styles.messageColumnOwn : ''}`}>
                     <div className={styles.messageMeta}>
                       <strong>{message.user}</strong>
                       <span>{message.at}</span>
                     </div>
-                    <div className={styles.messageBubble}>{message.text}</div>
+                    <div className={styles.messageBubble}>{renderMessageText(message.text)}</div>
                   </div>
                 </div>
-              ))}
+                )
+              })}
             </div>
 
             <div className={styles.chatBottom}>
-              {!isDark ? null : <button className={styles.chatDisabledBtn}>채팅하려면 로그인하세요</button>}
+              {isLoggedIn ? null : <button className={styles.chatDisabledBtn}>채팅하려면 로그인 ON으로 전환하세요</button>}
               <form
                 className={styles.chatInputRow}
                 onSubmit={(event) => {
                   event.preventDefault()
+                  if (!isLoggedIn) return
                   sendMessage()
                 }}
               >
@@ -684,9 +828,10 @@ function App() {
                   className={styles.chatInput}
                   value={chatInput}
                   onChange={(event) => setChatInput(event.target.value)}
+                  disabled={!isLoggedIn}
                   placeholder="#general 메시지 입력..."
                 />
-                <button className={styles.sendBtn} type="submit">➤</button>
+                <button className={styles.sendBtn} type="submit" disabled={!isLoggedIn}>➤</button>
               </form>
             </div>
           </aside>
